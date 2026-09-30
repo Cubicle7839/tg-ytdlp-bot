@@ -117,15 +117,24 @@ def check_download_timeout(user_id):
     return False
 
 # Helper function to safely get active download status
-def _adaptive_interval(elapsed_seconds):
+def _adaptive_interval(elapsed_seconds, user_id=None):
     """Calculate adaptive update interval based on elapsed time.
     
     0-4 min: 3s, 5-9: 4s, 10-14: 5s, ... 55-59: 14s, 60+: 90s.
+    ادمین: ×۳ و حداقل ۱۰ ثانیه ⇒ فشارِ FloodWait کمتر (ADMIN_LOW_FLOOD_MODE).
     """
     minutes_passed = int(elapsed_seconds // 60)
     if minutes_passed >= 60:
-        return 90.0
-    return 3.0 + max(0, minutes_passed // 5)
+        base = 90.0
+    else:
+        base = 3.0 + max(0, minutes_passed // 5)
+    try:
+        from HELPERS.flood_guard import low_flood_mode
+        if user_id is not None and low_flood_mode(user_id):
+            return max(base * 3.0, 10.0)
+    except Exception:
+        pass
+    return base
 
 
 def get_active_download(user_id):
@@ -228,7 +237,7 @@ def start_hourglass_animation(user_id, hourglass_msg_id, stop_anim):
                 
                 minutes_passed = int(elapsed // 60)
                 
-                interval = _adaptive_interval(elapsed)
+                interval = _adaptive_interval(elapsed, user_id)
                 
                 if current_time - last_update < interval:
                     time.sleep(1.0)
@@ -310,7 +319,7 @@ def start_cycle_progress(user_id, proc_msg_id, current_total_process, user_dir_n
                 
                 minutes_passed = int(elapsed // 60)
                 
-                interval = _adaptive_interval(elapsed)
+                interval = _adaptive_interval(elapsed, user_id)
                 
                 if current_time - last_update < interval:
                     time.sleep(1.0)
@@ -400,12 +409,20 @@ def progress_bar(*args):
         user_id, msg_id, status_text = args[5], args[6], args[7]
     else:
         user_id, msg_id, status_text = args[2], args[3], args[4]
-    # Throttle to avoid flood: update at most once per second per message
+    # Throttle to avoid flood: default at most once per second per message.
+    # ادمین: فاصلهٔ بیشتر (ADMIN_PROGRESS_EDIT_INTERVAL با ADMIN_LOW_FLOOD_MODE)
     now = time.time()
     key = (user_id, msg_id)
+    _min_edit_gap = 1.0
+    try:
+        from HELPERS.flood_guard import low_flood_mode, progress_edit_interval
+        if low_flood_mode(user_id):
+            _min_edit_gap = progress_edit_interval()
+    except Exception:
+        pass
     with _last_upload_ts_lock:
         last_ts = _last_upload_update_ts.get(key, 0)
-    if now - last_ts < 1.0 and current < total:
+    if now - last_ts < _min_edit_gap and current < total:
         return
 
     # Log upload activity every 10 seconds to prevent watchdog false positives

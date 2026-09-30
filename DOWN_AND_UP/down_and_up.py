@@ -799,38 +799,45 @@ def down_and_up(app, message, url, playlist_name, video_count, video_start_with,
         from HELPERS.safe_messeger import read_flood_wait_remaining, _write_flood_wait_file
         flood_remaining, flood_time_str = read_flood_wait_remaining(user_id)
 
-        # Send rate-limit message FIRST — if edit gets FloodWait, user sees this notice
-        if flood_remaining is not None:
-            proc_msg = safe_send_message(user_id, safe_get_messages(user_id).RATE_LIMIT_WITH_TIME_MSG.format(time=flood_time_str), message=message)
-        else:
-            proc_msg = safe_send_message(user_id, safe_get_messages(user_id).RATE_LIMIT_NO_TIME_MSG, message=message)
-
-        # Try to replace with "Download started" to confirm no FloodWait
+        # ادمین: نه پیامِ «Telegram has limited message sending»، نه پروبِ FloodWait
         try:
-            if proc_msg is not None and hasattr(proc_msg, 'id'):
-                app.edit_message_text(
-                    chat_id=user_id,
-                    message_id=proc_msg.id,
-                    text=safe_get_messages(user_id).DOWNLOAD_STARTED_MSG,
-                    parse_mode=enums.ParseMode.HTML
-                )
-                try:
-                    from HELPERS.safe_messeger import schedule_delete_message
-                    download_started_msg_id = proc_msg.id
-                    schedule_delete_message(user_id, download_started_msg_id, delete_after_seconds=5)
-                except Exception:
-                    pass
+            from HELPERS.flood_guard import bypass_enabled as _flood_bypass
+            _admin_flood_free = _flood_bypass(user_id)
+        except Exception:
+            _admin_flood_free = False
+        if not _admin_flood_free:
+            # Send rate-limit message FIRST — if edit gets FloodWait, user sees this notice
+            if flood_remaining is not None:
+                proc_msg = safe_send_message(user_id, safe_get_messages(user_id).RATE_LIMIT_WITH_TIME_MSG.format(time=flood_time_str), message=message)
             else:
-                logger.error(f"[FLOOD-CHECK] proc_msg is not Message: type={type(proc_msg)}, value={proc_msg}")
-        except FloodWait as e:
-            _write_flood_wait_file(user_id, e.value)
-            return
-        except Exception as e:
-            err_str = str(e)
-            if "MESSAGE_ID_INVALID" in err_str:
-                logger.debug(f"[FLOOD-CHECK] edit_message_text MESSAGE_ID_INVALID (message already deleted): {e}")
-            else:
-                logger.error(f"[FLOOD-CHECK] edit_message_text failed: {e}, proc_msg type={type(proc_msg)}")
+                proc_msg = safe_send_message(user_id, safe_get_messages(user_id).RATE_LIMIT_NO_TIME_MSG, message=message)
+
+            # Try to replace with "Download started" to confirm no FloodWait
+            try:
+                if proc_msg is not None and hasattr(proc_msg, 'id'):
+                    app.edit_message_text(
+                        chat_id=user_id,
+                        message_id=proc_msg.id,
+                        text=safe_get_messages(user_id).DOWNLOAD_STARTED_MSG,
+                        parse_mode=enums.ParseMode.HTML
+                    )
+                    try:
+                        from HELPERS.safe_messeger import schedule_delete_message
+                        download_started_msg_id = proc_msg.id
+                        schedule_delete_message(user_id, download_started_msg_id, delete_after_seconds=5)
+                    except Exception:
+                        pass
+                else:
+                    logger.error(f"[FLOOD-CHECK] proc_msg is not Message: type={type(proc_msg)}, value={proc_msg}")
+            except FloodWait as e:
+                _write_flood_wait_file(user_id, e.value)
+                return
+            except Exception as e:
+                err_str = str(e)
+                if "MESSAGE_ID_INVALID" in err_str:
+                    logger.debug(f"[FLOOD-CHECK] edit_message_text MESSAGE_ID_INVALID (message already deleted): {e}")
+                else:
+                    logger.error(f"[FLOOD-CHECK] edit_message_text failed: {e}, proc_msg type={type(proc_msg)}")
 
         # If there is no flood error, send a normal message
         proc_msg = app.send_message(user_id, safe_get_messages(user_id).PROCESSING_MSG, reply_parameters=ReplyParameters(message_id=message.id))

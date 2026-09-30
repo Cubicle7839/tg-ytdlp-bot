@@ -701,36 +701,43 @@ def down_and_audio(app, message, url, tags, quality_key=None, playlist_name=None
         from HELPERS.safe_messeger import read_flood_wait_remaining, _write_flood_wait_file
         flood_remaining, flood_time_str = read_flood_wait_remaining(user_id)
 
-        # We send the initial message
-        if flood_remaining is not None:
-            proc_msg = safe_send_message(user_id, safe_get_messages(user_id).RATE_LIMIT_WITH_TIME_MSG.format(time=flood_time_str), message=message)
-        else:
-            proc_msg = safe_send_message(user_id, safe_get_messages(user_id).RATE_LIMIT_NO_TIME_MSG, message=message)
-
-        # We are trying to replace with "Download started"
+        # ادمین: نه پیامِ «Telegram has limited message sending»، نه پروبِ FloodWait
         try:
-            app.edit_message_text(
-                chat_id=user_id,
-                message_id=proc_msg.id,
-                text=safe_get_messages(user_id).DOWNLOAD_STARTED_MSG,
-                parse_mode=enums.ParseMode.HTML
-            )
-            # Schedule deletion of "Download started" message after 5 seconds
+            from HELPERS.flood_guard import bypass_enabled as _flood_bypass
+            _admin_flood_free = _flood_bypass(user_id)
+        except Exception:
+            _admin_flood_free = False
+        if not _admin_flood_free:
+            # We send the initial message
+            if flood_remaining is not None:
+                proc_msg = safe_send_message(user_id, safe_get_messages(user_id).RATE_LIMIT_WITH_TIME_MSG.format(time=flood_time_str), message=message)
+            else:
+                proc_msg = safe_send_message(user_id, safe_get_messages(user_id).RATE_LIMIT_NO_TIME_MSG, message=message)
+
+            # We are trying to replace with "Download started"
             try:
-                from HELPERS.safe_messeger import schedule_delete_message
-                schedule_delete_message(user_id, proc_msg.id, delete_after_seconds=5)
+                app.edit_message_text(
+                    chat_id=user_id,
+                    message_id=proc_msg.id,
+                    text=safe_get_messages(user_id).DOWNLOAD_STARTED_MSG,
+                    parse_mode=enums.ParseMode.HTML
+                )
+                # Schedule deletion of "Download started" message after 5 seconds
+                try:
+                    from HELPERS.safe_messeger import schedule_delete_message
+                    schedule_delete_message(user_id, proc_msg.id, delete_after_seconds=5)
+                except Exception as e:
+                    logger.error(f"Error scheduling download started message deletion: {e}")
+            except FloodWait as e:
+                _write_flood_wait_file(user_id, e.value)
+                return
             except Exception as e:
-                logger.error(f"Error scheduling download started message deletion: {e}")
-        except FloodWait as e:
-            _write_flood_wait_file(user_id, e.value)
-            return
-        except Exception as e:
-            logger.error(f"Error editing message: {e}")
-            # Stop animation before returning
-            stop_anim.set()
-            if anim_thread:
-                anim_thread.join(timeout=1)
-            return
+                logger.error(f"Error editing message: {e}")
+                # Stop animation before returning
+                stop_anim.set()
+                if anim_thread:
+                    anim_thread.join(timeout=1)
+                return
 
         # If there is no flood error, send a normal message (only once)
         proc_msg = app.send_message(user_id, safe_get_messages(user_id).PROCESSING_MSG, reply_parameters=ReplyParameters(message_id=message.id))
