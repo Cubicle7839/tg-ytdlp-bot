@@ -246,7 +246,9 @@ def self_link_record(url: str):
             return None
         token = parts[1]
         from HELPERS import filelink_routes as _fr
-        rec = _fr.resolve(token)
+        # allow_expired=True ⇒ لینکِ منقضی هم برای «خودِ ربات» قابلِ استفاده است
+        # (لینکِ عمومی همان‌طور ۴۰۴ می‌ماند، ولی فایل تا مهلتِ نگه‌داری روی دیسک است)
+        rec = _fr.resolve(token, allow_expired=True)
         if rec and os.path.exists(rec.get("path") or ""):
             return rec
     except Exception as exc:
@@ -509,7 +511,9 @@ def download_direct(app, message, url: str, user_id: int, kind_hint: str = "") -
                         last_edit = now
                         safe_edit_message_text(user_id, msg_id,
                                                _progress_text(name, written, total_remote, started,
-                                                              note="📁 کپیِ محلی (فایلِ خودِ ربات)"),
+                                                              note=("📁 کپیِ محلی (فایلِ خودِ ربات)"
+                                                                    + (" · لینک منقضی بود ولی فایل هنوز بود"
+                                                                       if (_self_rec or {}).get("expired") else ""))),
                                                parse_mode="html", reply_markup=keyboard(user_id))
                     if written > max_bytes:
                         raise _TooBig(f"حجم از سقفِ {getattr(LimitsConfig, 'MAX_FILE_SIZE_GB', 2)}GB گذشت")
