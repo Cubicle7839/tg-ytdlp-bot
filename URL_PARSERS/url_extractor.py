@@ -1321,6 +1321,19 @@ def url_distractor(app, message):
             except Exception as ext_check_error:
                 logger.error(f"URL_EXTRACTOR: failed to apply unsupported extension guard: {ext_check_error}")
 
+            # ── لینکِ مستقیم (فایلِ خام): دانلودِ خودمان با نمایشِ پیشرفت و
+            #    پشتیبانیِ «❌ لغو» و «🔄 ادامه» (به‌جای سپردنِ آن به yt-dlp) ──
+            try:
+                import re as _dl_re
+                _dl_match = _dl_re.search(r"https?://\S+", final_text or "")
+                _dl_url = _dl_match.group(0) if _dl_match else ""
+                if _dl_url:
+                    from HELPERS.direct_link import maybe_handle_direct_link
+                    if maybe_handle_direct_link(app, message, _dl_url, user_id):
+                        return
+            except Exception as _dl_err:
+                logger.error(f"URL_EXTRACTOR: direct-link handler failed: {_dl_err}")
+
             # Check rate limit before processing URL
             from HELPERS.rate_limiter import check_rate_limit
             allowed, rate_limit_msg = check_rate_limit(user_id, is_admin)
