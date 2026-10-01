@@ -164,14 +164,16 @@ def probe(url: str, timeout: int = 8) -> Dict[str, Any]:
             r = requests.head(url, headers=headers, timeout=timeout, allow_redirects=True)
             if r.status_code >= 400:
                 raise RuntimeError(f"HEAD {r.status_code}")
-            info = {"content_type": r.headers.get("Content-Type", ""),
+            info = {"status": r.status_code,
+                    "content_type": r.headers.get("Content-Type", ""),
                     "length": int(r.headers.get("Content-Length") or 0),
                     "accept_ranges": "bytes" in (r.headers.get("Accept-Ranges", "") or "").lower(),
                     "final_url": r.url, "headers": dict(r.headers)}
         except Exception:
             r = requests.get(url, headers=headers, timeout=timeout, stream=True, allow_redirects=True)
             try:
-                info = {"content_type": r.headers.get("Content-Type", ""),
+                info = {"status": r.status_code,
+                        "content_type": r.headers.get("Content-Type", ""),
                         "length": int(r.headers.get("Content-Length") or 0),
                         "accept_ranges": "bytes" in (r.headers.get("Accept-Ranges", "") or "").lower(),
                         "final_url": r.url, "headers": dict(r.headers)}
@@ -198,6 +200,36 @@ def is_media_file_url(url: str) -> bool:
     except Exception:
         return False
     return ext in MEDIA_EXTS or ext in TS_EXTS or ext in _extra_exts()
+
+
+def _filelink_parts(url: str):
+    """(token, name) اگر مسیرِ لینک شبیهِ ‎/d/<token>[/name]‎ باشد، وگرنه None."""
+    try:
+        parts = [p for p in (urllib.parse.urlparse(url).path or "").split("/") if p]
+    except Exception:
+        return None
+    if len(parts) >= 2 and parts[0] == "d":
+        return parts[1], (parts[2] if len(parts) > 2 else "")
+    return None
+
+
+def local_mirror_urls(url: str) -> list:
+    """آدرس‌های محلی (127.0.0.1) برای همان لینک؛ سرورِ فایل/سلامت روی همین کانتینر است.
+
+    فایده: دانلودِ لینکِ خودِ ربات به دامنهٔ عمومی/کلودفلر و «hairpin» وابسته نمی‌شود.
+    """
+    got = _filelink_parts(url)
+    if not got:
+        return []
+    token, name = got
+    path = "/d/" + token + (("/" + name) if name else "")
+    out, seen = [], set()
+    for key in ("HEALTH_PORT", "PORT", "LINK_PORT", "HEALTHCHECK_PORT"):
+        raw = (os.environ.get(key) or "").strip()
+        if raw.isdigit() and int(raw) not in seen:
+            seen.add(int(raw))
+            out.append(f"http://127.0.0.1:{int(raw)}{path}")
+    return out
 
 
 def self_link_record(url: str):
@@ -247,6 +279,12 @@ def is_direct_link(url: str, deep: bool = True) -> Tuple[bool, str]:
     # لینکِ فایلِ خودِ ربات (ساختهٔ همین ربات) همیشه لینکِ مستقیم است
     if is_self_filelink(url):
         return True, "self-link"
+    # اگر مسیرش ‎/d/<token>‎ است، از سرورِ محلیِ خودمان بپرس (بدونِ وابستگی به دامنه)
+    if _filelink_parts(url):
+        for _mirror in local_mirror_urls(url):
+            _mi = probe(_mirror, timeout=3)
+            if (_mi or {}).get("status") == 200:
+                return True, "self-link(local)"
     ext = _ext(parsed.path or "")
     if ext in MANIFEST_EXTS:
         return False, f"manifest:{ext}"
@@ -476,56 +514,73 @@ def download_direct(app, message, url: str, user_id: int, kind_hint: str = "") -
                     if written > max_bytes:
                         raise _TooBig(f"حجم از سقفِ {getattr(LimitsConfig, 'MAX_FILE_SIZE_GB', 2)}GB گذشت")
             done = True
-        while not done:
-            if cancel_ev.is_set():
-                raise _Cancelled("لغو توسط کاربر")
-            if pos and info.get("accept_ranges") is not False:
-                headers["Range"] = f"bytes={pos}-"
-            r = requests.get(url, headers=headers, stream=True, timeout=(20, 90),
-                             allow_redirects=True)
-            if r.status_code == 416:                      # فایل از قبل کامل است
-                r.close()
-                done = True
-                break
-            if r.status_code == 200 and "Range" in headers:
-                pos = 0                                   # سرور Range را پشتیبانی نکرد
-            if r.status_code not in (200, 206):
-                r.close()
-                raise RuntimeError(f"HTTP {r.status_code}")
-            if r.status_code == 206 and pos:
-                # اگر سرور از بایتِ درخواستی شروع نکرد، دوباره از صفر بنویس
-                cont = (r.headers.get("Content-Range") or "").strip()
+        if not done:
+            # منابعِ ممکن: سرورِ محلیِ خودِ ربات (اگر لینک ‎/d/...‎ باشد) و بعد آدرسِ اصلی
+            _cands = local_mirror_urls(url) if _env_bool("DIRECT_LINK_LOCAL_MIRROR", True) else []
+            if url not in _cands:
+                _cands.append(url)
+            for _idx, _cand in enumerate(_cands):
+                _hdrs = dict(headers)
+                _from_local = _cand != url
                 try:
-                    _start = int(cont.split(" ")[1].split("-")[0]) if " " in cont else pos
-                except Exception:
-                    _start = pos
-                if _start != pos:
-                    logger.warning(f"[DIRECT] server resumed at {_start} instead of {pos}; restarting file")
-                    pos = 0
-            total = int(r.headers.get("Content-Length") or 0) + pos
-            mode = "ab" if pos else "wb"
-            written = pos
-            with open(target_path, mode) as fh:
-                for chunk in r.iter_content(chunk_size=512 * 1024):
                     if cancel_ev.is_set():
-                        r.close()
                         raise _Cancelled("لغو توسط کاربر")
-                    if not chunk:
+                    if pos and info.get("accept_ranges") is not False:
+                        _hdrs["Range"] = f"bytes={pos}-"
+                    r = requests.get(_cand, headers=_hdrs, stream=True, timeout=(20, 90),
+                                     allow_redirects=True)
+                    if r.status_code == 416:                      # فایل از قبل کامل است
+                        r.close()
+                        done = True
+                        break
+                    if r.status_code == 200 and "Range" in _hdrs:
+                        pos = 0                                   # سرور Range را پشتیبانی نکرد
+                    if r.status_code not in (200, 206):
+                        r.close()
+                        raise RuntimeError(f"HTTP {r.status_code}")
+                    if r.status_code == 206 and pos:
+                        # اگر سرور از بایتِ درخواستی شروع نکرد، دوباره از صفر بنویس
+                        cont = (r.headers.get("Content-Range") or "").strip()
+                        try:
+                            _start = int(cont.split(" ")[1].split("-")[0]) if " " in cont else pos
+                        except Exception:
+                            _start = pos
+                        if _start != pos:
+                            logger.warning(f"[DIRECT] server resumed at {_start} instead of {pos}; restarting file")
+                            pos = 0
+                    total = int(r.headers.get("Content-Length") or 0) + pos
+                    mode = "ab" if pos else "wb"
+                    written = pos
+                    with open(target_path, mode) as fh:
+                        for chunk in r.iter_content(chunk_size=512 * 1024):
+                            if cancel_ev.is_set():
+                                r.close()
+                                raise _Cancelled("لغو توسط کاربر")
+                            if not chunk:
+                                continue
+                            fh.write(chunk)
+                            written += len(chunk)
+                            touch(user_id, "download")
+                            now = time.time()
+                            if msg_id and (now - last_edit) >= _adaptive_interval(now - started, user_id):
+                                last_edit = now
+                                safe_edit_message_text(
+                                    user_id, msg_id,
+                                    _progress_text(name, written, total, started,
+                                                   note=("🔗 از سرورِ محلیِ خودِ ربات" if _from_local else "")),
+                                    parse_mode="html", reply_markup=keyboard(user_id))
+                            if written > max_bytes:
+                                raise _TooBig(f"حجم از سقفِ {getattr(LimitsConfig, 'MAX_FILE_SIZE_GB', 2)}GB گذشت")
+                    r.close()
+                    done = True
+                    break
+                except (_Cancelled, _TooBig):
+                    raise
+                except Exception as _cand_err:
+                    if _idx < len(_cands) - 1:
+                        logger.warning(f"[DIRECT] source failed ({_cand}): {_cand_err} → trying next source")
                         continue
-                    fh.write(chunk)
-                    written += len(chunk)
-                    touch(user_id, "download")
-                    now = time.time()
-                    if msg_id and (now - last_edit) >= _adaptive_interval(now - started, user_id):
-                        last_edit = now
-                        safe_edit_message_text(user_id, msg_id,
-                                               _progress_text(name, written, total, started),
-                                               parse_mode="html", reply_markup=keyboard(user_id))
-                    if written > max_bytes:
-                        raise _TooBig(f"حجم از سقفِ {getattr(LimitsConfig, 'MAX_FILE_SIZE_GB', 2)}GB گذشت")
-            r.close()
-            break
-        done = True
+                    raise
     except _Cancelled:
         logger.info(f"[DIRECT] cancelled by user {user_id}: {url[:80]}")
         clear(user_id)
@@ -569,9 +624,14 @@ def download_direct(app, message, url: str, user_id: int, kind_hint: str = "") -
                 pass
             return False
         try:
+            _reason = f"خطا: {exc}"
+            if _filelink_parts(url):
+                # لینکِ ‎/d/...‎ یعنی لینکِ فایلِ یک ربات: معمولاً منقضی‌شده یا فایل پاک‌شده
+                _reason = (f"لینکِ خودِ سرور جواب نداد ({exc}) — ممکن است لینک منقضی شده "
+                           f"یا فایلش از سرور پاک شده باشد")
             offer_resume(user_id, message,
                          lambda: download_direct(app, message, url, user_id, kind_hint),
-                         url=url, kind="direct", reason=f"خطا: {exc}", msg_id=msg_id)
+                         url=url, kind="direct", reason=_reason, msg_id=msg_id)
             if msg_id:
                 safe_edit_message_text(user_id, msg_id,
                                        f"⚠️ دانلود ناتمام ماند (<i>{html.escape(str(exc))[:120]}</i>) — "
