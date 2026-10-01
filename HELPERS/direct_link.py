@@ -45,6 +45,13 @@ OCTET_TYPES = ("application/octet-stream", "binary/octet-stream", "application/m
                "application/x-matroska")
 MANIFEST_TYPES = ("application/vnd.apple.mpegurl", "application/x-mpegurl",
                   "audio/mpegurl", "application/dash+xml")
+# نوع‌هایی که «صفحهٔ وب/API» هستند ⇒ هرگز لینکِ مستقیم نیستند
+WEB_TYPES = ("text/html", "application/xhtml+xml", "text/xml", "application/xml",
+             "application/json", "application/ld+json", "application/problem+json",
+             "application/rss+xml", "application/atom+xml", "text/plain")
+# سندهای باینریِ رایج که مستقیم دانلود می‌شوند
+DOC_TYPES = ("application/pdf", "application/epub+zip", "application/x-mobipocket-ebook",
+             "application/vnd.amazon.ebook")
 MIN_PROBE_BYTES = 256 * 1024          # برای لینکِ بی‌پسوند، فایلِ کوچکِ octet را نگیر
 SKIP_HOSTS = {"youtube.com", "youtu.be", "m.youtube.com", "instagram.com", "tiktok.com",
               "twitter.com", "x.com", "facebook.com", "fb.watch", "vimeo.com", "dailymotion.com"}
@@ -193,6 +200,38 @@ def is_media_file_url(url: str) -> bool:
     return ext in MEDIA_EXTS or ext in TS_EXTS or ext in _extra_exts()
 
 
+def self_link_record(url: str):
+    """اگر لینک، لینکِ فایلِ خودِ همین ربات باشد رکوردش را برمی‌گرداند (وگرنه None).
+
+    لینک‌های ``/d/<token>`` و ``/d/<token>/<name>`` در ``links.json`` همین ربات ثبت
+    می‌شوند؛ پس هم تشخیصِ «لینکِ مستقیم» قطعی است و هم می‌توان فایل را محلی کپی
+    کرد (بدونِ رفت‌وبرگشتِ اینترنتی و بدونِ وابستگی به دامنهٔ عمومی).
+    """
+    try:
+        parsed = urllib.parse.urlparse(url)
+        parts = [p for p in (parsed.path or "").split("/") if p]
+        if len(parts) < 2 or parts[0] != "d":
+            return None
+        token = parts[1]
+        from HELPERS import filelink_routes as _fr
+        rec = _fr.resolve(token)
+        if rec and os.path.exists(rec.get("path") or ""):
+            return rec
+    except Exception as exc:
+        logger.debug(f"[DIRECT] self-link check failed: {exc}")
+    return None
+
+
+def self_link_local_path(url: str) -> str:
+    """مسیرِ محلیِ فایل اگر لینک مالِ خودِ ربات باشد؛ وگرنه رشتهٔ خالی."""
+    rec = self_link_record(url)
+    return (rec or {}).get("path") or ""
+
+
+def is_self_filelink(url: str) -> bool:
+    return self_link_record(url) is not None
+
+
 def is_direct_link(url: str, deep: bool = True) -> Tuple[bool, str]:
     """آیا این لینک، فایلِ خام است؟ (خروجی: (بله/خیر، دلیل))"""
     if _env_bool("DIRECT_LINK_DISABLE", False):
@@ -205,6 +244,9 @@ def is_direct_link(url: str, deep: bool = True) -> Tuple[bool, str]:
         # rtsp/ftp/magnet/… دستِ yt-dlp یا ردِ صریح
         return False, f"scheme:{(parsed.scheme or 'none').lower()}"
     host = (parsed.hostname or "").lower()
+    # لینکِ فایلِ خودِ ربات (ساختهٔ همین ربات) همیشه لینکِ مستقیم است
+    if is_self_filelink(url):
+        return True, "self-link"
     ext = _ext(parsed.path or "")
     if ext in MANIFEST_EXTS:
         return False, f"manifest:{ext}"
@@ -221,12 +263,23 @@ def is_direct_link(url: str, deep: bool = True) -> Tuple[bool, str]:
     info = probe(url)
     ct = (info.get("content_type") or "").lower().split(";")[0].strip()
     length = int(info.get("length") or 0)
+    disp_name = _name_from_headers(info.get("headers") or {}, url) if info.get("headers") else ""
+    has_disp = any(k.lower() == "content-disposition" for k in (info.get("headers") or {}))
+    disp_ext = _ext(disp_name)
     if ct in MANIFEST_TYPES:
         # HLS/DASH بدونِ پسوندِ .m3u8: باز هم مانیفست است ⇒ کارِ yt-dlp
         return False, f"manifest-ct:{ct}"
     if ct.startswith("video/") or ct.startswith("audio/"):
         return True, f"ct:{ct}"
-    if ct in OCTET_TYPES and length >= MIN_PROBE_BYTES:
+    if has_disp and disp_ext in (MEDIA_EXTS | TS_EXTS | _extra_exts()):
+        # سرور خودش گفته «فایلِ ضمیمه با این نام» ⇒ قطعاً لینکِ مستقیم است
+        return True, f"attachment:{disp_ext}"
+    if has_disp and ct not in WEB_TYPES:
+        # Content-Disposition: attachment با هر نوعِ غیرِ وب (zip/pdf/bin/…) ⇒ فایل
+        return True, f"attachment:{ct or 'binary'}"
+    if ct in DOC_TYPES:
+        return True, f"ct:{ct}"
+    if ct in OCTET_TYPES and (length >= MIN_PROBE_BYTES or has_disp):
         return True, f"ct:{ct}"
     return False, f"ct:{ct or 'unknown'}"
 
@@ -347,14 +400,26 @@ def download_direct(app, message, url: str, user_id: int, kind_hint: str = "") -
 
     try:
         import requests
-        info = probe(url)
         headers = {"User-Agent": os.environ.get("DIRECT_LINK_UA", DEFAULT_UA),
                    "Accept": "*/*", "Referer": url}
-        name = _name_from_headers(info.get("headers") or {}, url)
-        if not _ext(name):
-            ext = _content_type_ext(info.get("content_type") or "")
-            if ext:
-                name += ext
+        # ۱) لینکِ فایلِ خودِ ربات؟ ⇒ فایل همان‌جاست، محلی کپی می‌کنیم
+        #    (نامِ فایل روی دیسک «<token>_<name>» است؛ نامِ اصلی از رکورد می‌آید)
+        _self_rec = self_link_record(url) if _env_bool("DIRECT_LINK_LOCAL_SELF", True) else None
+        local_src = (_self_rec or {}).get("path") or ""
+        if local_src and os.path.exists(local_src):
+            info = {"content_type": "", "length": os.path.getsize(local_src),
+                    "accept_ranges": True, "local": True, "headers": {}}
+            name = _clean_name((_self_rec or {}).get("name") or os.path.basename(local_src),
+                               fallback="file")
+            logger.info(f"[DIRECT] self-link → local copy ({hsize(info['length'])}, '{name}') for {user_id}")
+        else:
+            local_src = ""
+            info = probe(url)
+            name = _name_from_headers(info.get("headers") or {}, url)
+            if not _ext(name):
+                ext = _content_type_ext(info.get("content_type") or "")
+                if ext:
+                    name += ext
         total_remote = int(info.get("length") or 0)
         if total_remote and total_remote > max_bytes:
             safe_send_message(user_id,
@@ -386,7 +451,32 @@ def download_direct(app, message, url: str, user_id: int, kind_hint: str = "") -
 
         started = time.time()
         last_edit = 0.0
-        while True:
+        if local_src:
+            # کپیِ محلیِ همان فایل (سریع، بدونِ شبکه؛ با پشتیبانیِ لغو و ادامه)
+            with open(local_src, "rb") as src, open(target_path, "ab" if pos else "wb") as dst:
+                if pos:
+                    src.seek(pos)
+                written = pos
+                while True:
+                    if cancel_ev.is_set():
+                        raise _Cancelled("لغو توسط کاربر")
+                    chunk = src.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    dst.write(chunk)
+                    written += len(chunk)
+                    touch(user_id, "download")
+                    now = time.time()
+                    if msg_id and (now - last_edit) >= _adaptive_interval(now - started, user_id):
+                        last_edit = now
+                        safe_edit_message_text(user_id, msg_id,
+                                               _progress_text(name, written, total_remote, started,
+                                                              note="📁 کپیِ محلی (فایلِ خودِ ربات)"),
+                                               parse_mode="html", reply_markup=keyboard(user_id))
+                    if written > max_bytes:
+                        raise _TooBig(f"حجم از سقفِ {getattr(LimitsConfig, 'MAX_FILE_SIZE_GB', 2)}GB گذشت")
+            done = True
+        while not done:
             if cancel_ev.is_set():
                 raise _Cancelled("لغو توسط کاربر")
             if pos and info.get("accept_ranges") is not False:
