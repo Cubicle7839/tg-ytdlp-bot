@@ -1262,6 +1262,7 @@ def url_distractor(app, message):
                         _cdn_host = (_cdn_parsed.hostname or '').lower()
                         if _cdn_host:
                             from CONFIG.domains import DomainsConfig as _DC
+                            from HELPERS.direct_link import is_media_file_url as _dl_is_media_file
                             # Defensive access (issue #400): some production builds
                             # deploy url_extractor.py ahead of CONFIG/domains.py, so
                             # the CDN_REJECT_DOMAINS attribute may be absent. A missing
@@ -1274,6 +1275,15 @@ def url_distractor(app, message):
                             for _cdn_domain in (_cdn_reject_domains or []):
                                 _cdn_domain_lower = _cdn_domain.lower().strip()
                                 if _cdn_host == _cdn_domain_lower or _cdn_host.endswith('.' + _cdn_domain_lower):
+                                    # استثنا: فایلِ خامِ مدیا (مثل .../segment1.ts یا ....mp4) روی همین
+                                    # دامنه‌ها حالا با مسیرِ «لینکِ مستقیم» دانلود می‌شود ⇒ بلاک نکن.
+                                    try:
+                                        if _cdn_parsed.path and _dl_is_media_file(raw_url):
+                                            logger.info(f"URL_EXTRACTOR: allowing raw media file on CDN "
+                                                        f"domain '{_cdn_domain}' (direct-link path): {raw_url}")
+                                            break
+                                    except Exception as _cdn_allow_err:
+                                        logger.debug(f"URL_EXTRACTOR: CDN allow-check failed: {_cdn_allow_err}")
                                     logger.info(f"URL_EXTRACTOR: blocking raw CDN domain '{_cdn_domain}' for URL '{raw_url}'")
                                     _cdn_err_msg = (
                                         f"❌ <b>This is a raw CDN URL, not a video page.</b>\n\n"

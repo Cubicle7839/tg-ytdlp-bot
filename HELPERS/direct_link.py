@@ -181,6 +181,18 @@ def probe(url: str, timeout: int = 8) -> Dict[str, Any]:
     return info
 
 
+def is_media_file_url(url: str) -> bool:
+    """آیا مسیرِ لینک، پسوندِ فایلِ خامِ مدیا/سند دارد؟ (بدونِ شبکه — برای گاردِ CDN)
+
+    فقط پسوندِ مسیر را نگاه می‌کند: ``.../segment1.ts`` ⇒ True · ``.../master.m3u8`` ⇒ False
+    """
+    try:
+        ext = _ext(urllib.parse.urlparse(url).path or "")
+    except Exception:
+        return False
+    return ext in MEDIA_EXTS or ext in TS_EXTS or ext in _extra_exts()
+
+
 def is_direct_link(url: str, deep: bool = True) -> Tuple[bool, str]:
     """آیا این لینک، فایلِ خام است؟ (خروجی: (بله/خیر، دلیل))"""
     if _env_bool("DIRECT_LINK_DISABLE", False):
